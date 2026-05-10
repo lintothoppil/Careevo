@@ -9,7 +9,7 @@
     
     <style>
         body {
-            background-color: #f0f2f5;
+            background-color: #F6FFF9;
         }
         .stats-card {
             background-color: #ffffff;
@@ -25,16 +25,16 @@
         }
         .stats-card i {
             font-size: 2.5rem;
-            color: #6c757d;
+            color: #6B7280;
             margin-bottom: 15px;
         }
         .stats-card h3 {
             font-size: 2rem;
             font-weight: 700;
-            color: #343a40;
+            color: #2E2E2E;
         }
         .stats-card p {
-            color: #6c757d;
+            color: #6B7280;
             font-weight: 500;
         }
         .card-custom {
@@ -42,7 +42,7 @@
             box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
         }
         .card-header {
-            background-color: #667eea;
+            background-color: #3EB489;
             color: white;
             border-top-left-radius: 15px;
             border-top-right-radius: 15px;
@@ -60,12 +60,12 @@
             background-color: rgba(102, 126, 234, 0.05);
         }
         .btn-custom {
-            background-color: #667eea;
+            background-color: #3EB489;
             color: white;
             border: none;
         }
         .btn-custom:hover {
-            background-color: #5563c6;
+            background-color: #28a073;
             color: white;
         }
         .nav-link {
@@ -75,9 +75,12 @@
     {% block head %}{% endblock %}
 </head>
 <body>
-    <nav class="navbar navbar-expand-lg navbar-dark bg-dark">
+    <nav class="navbar navbar-expand-lg navbar-light bg-white">
         <div class="container-fluid">
-            <a class="navbar-brand" href="{{ url_for('index') }}">Rezum.Ai</a>
+            <a class="navbar-brand d-flex align-items-center" href="{{ url_for('index') }}">
+                <img src="{{ url_for('static', filename='images/careevo-logo.png') }}" alt="Careevo Logo" height="32" class="me-2">
+                <span style="color: #2E2E2E; font-weight: 800; letter-spacing: -0.03em;">Careevo</span>
+            </a>
             <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
                 <span class="navbar-toggler-icon"></span>
             </button>

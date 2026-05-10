@@ -5,17 +5,23 @@
 {% block content %}
 <style>
     :root {
-        --primary-gradient: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        --secondary-gradient: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
-        --success-gradient: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
-        --warning-gradient: linear-gradient(135deg, #43e97b 0%, #38f9d7 100%);
-        --dark-bg: #0f172a;
-        --card-bg: rgba(30, 41, 59, 0.8);
-        --glass-bg: rgba(255, 255, 255, 0.1);
-        --neon-glow: 0 0 20px rgba(102, 126, 234, 0.5);
-        --text-primary: #ffffff;
-        --text-secondary: #cbd5e1;
-        --text-muted: #94a3b8;
+        --color-primary: #3EB489;
+        --color-secondary: #A7F3D0;
+        --color-accent: #A7F3D0;
+        --color-success: #3EB489;
+        --color-warning: #f59e0b;
+        --color-light: #F6FFF9;
+        --color-dark: #2E2E2E;
+        --color-gray: #6B7280;
+        --gradient-primary: linear-gradient(135deg, #3EB489, #28a073);
+        --gradient-secondary: linear-gradient(135deg, #A7F3D0, #3EB489);
+
+        --shadow-sm: 0 1px 2px rgba(0,0,0,0.05);
+        --shadow-md: 0 4px 6px -1px rgba(0,0,0,0.05);
+        --shadow-lg: 0 10px 15px -3px rgba(46,46,46,0.05);
+        --shadow-xl: 0 20px 25px -5px rgba(46,46,46,0.1);
+        --border-radius: 8px;
+        --border-radius-lg: 12px;
     }
 
     .admin-dashboard {
@@ -204,7 +210,7 @@
 
     .activity-item {
         padding: 1rem;
-        border-left: 3px solid #667eea;
+        border-left: 3px solid #3EB489;
         margin-bottom: 0.5rem;
         background: rgba(255, 255, 255, 0.05);
         border-radius: 0 10px 10px 0;
@@ -680,12 +686,12 @@
 
                     <div class="mb-3">
                         <label class="form-label text-white"><strong>User Feedback</strong></label>
-                        <div id="modalFeedback" class="feedback-content p-3 bg-dark rounded text-white"></div>
+                        <div id="modalFeedback" class="feedback-content p-3 bg-white rounded text-white"></div>
                     </div>
 
                     <div class="mb-3">
                         <label for="admin_reply" class="form-label text-white"><strong>Your Response</strong></label>
-                        <textarea class="form-control bg-dark text-white border-0" 
+                        <textarea class="form-control bg-white text-white border-0" 
                                   name="admin_reply" 
                                   id="modalAdminReply" 
                                   rows="4" 
@@ -856,11 +862,11 @@
                 datasets: [{
                     label: 'Daily Logins',
                     data: loginCounts,
-                    borderColor: '#667eea',
+                    borderColor: '#3EB489',
                     backgroundColor: 'rgba(102, 126, 234, 0.1)',
                     tension: 0.4,
                     fill: true,
-                    pointBackgroundColor: '#667eea',
+                    pointBackgroundColor: '#3EB489',
                     pointBorderColor: '#fff',
                     pointBorderWidth: 2
                 }]
@@ -1000,7 +1006,7 @@
         justify-content: center;
         color: white;
         font-weight: bold;
-        background: #667eea !important;
+        background: #3EB489 !important;
     }
 
     .pulse {
@@ -1028,7 +1034,7 @@
     }
 
     .feedback-content {
-        border-left: 4px solid #667eea;
+        border-left: 4px solid #3EB489;
         background: rgba(255, 255, 255, 0.05);
         color: var(--text-secondary);
     }
@@ -1064,7 +1070,7 @@
     }
 
     .bg-primary {
-        background-color: #667eea !important;
+        background-color: #3EB489 !important;
     }
 
     .bg-success {

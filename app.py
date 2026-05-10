@@ -1,7 +1,14 @@
 import os
+from dotenv import load_dotenv
+load_dotenv()
 import sqlite3
 import secrets
-from datetime import datetime
+import smtplib
+from datetime import datetime, timedelta
+from email.message import EmailMessage
+from pathlib import Path
+from urllib.parse import quote_plus, urlparse
+from urllib.request import urlopen
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 from flask import Flask, render_template, request, redirect, url_for, flash, session, jsonify, send_file
@@ -18,6 +25,15 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 from reportlab.lib import colors
 import io
+
+
+# --- Universal Resume Intelligence Engine ---
+try:
+    from resume_intelligence import full_resume_analysis
+    from skill_normalizer import UNIVERSAL_JOB_ROLES, skills_from_text
+    INTELLIGENCE_ENGINE_ACTIVE = True
+except ImportError as _ie:
+    INTELLIGENCE_ENGINE_ACTIVE = False
 
 # Set up basic logging
 logging.basicConfig(level=logging.INFO)
@@ -111,6 +127,46 @@ def load_jobs_data():
     ]
     return local_jobs + api_jobs
 
+
+def normalize_skill_phrase(value):
+    """Normalize a skill phrase for comparison."""
+    return re.sub(r'\s+', ' ', re.sub(r'[^a-z0-9+#./ ]+', ' ', (value or '').lower())).strip()
+
+
+def skill_present_in_text(skill, text):
+    """Return True when a skill phrase appears as a bounded phrase in text."""
+    normalized_skill = normalize_skill_phrase(skill)
+    normalized_text = normalize_skill_phrase(text)
+    if not normalized_skill or not normalized_text:
+        return False
+    pattern = r'(?<![a-z0-9+#./])' + re.escape(normalized_skill) + r'(?![a-z0-9+#./])'
+    return re.search(pattern, normalized_text) is not None
+
+
+def strip_html_tags(value):
+    """Strip HTML tags from chat responses before saving plain text history."""
+    return re.sub(r'<[^>]+>', '', value or '').strip()
+
+
+def translate_text(text, target_language):
+    """Translate plain text using a lightweight web translation endpoint."""
+    if not text or not target_language or target_language.startswith('en'):
+        return text
+
+    base_language = target_language.split('-', 1)[0]
+    try:
+        query = quote_plus(text)
+        url = (
+            "https://translate.googleapis.com/translate_a/single"
+            f"?client=gtx&sl=auto&tl={base_language}&dt=t&q={query}"
+        )
+        with urlopen(url, timeout=8) as response:
+            payload = json.loads(response.read().decode('utf-8'))
+        translated = ''.join(part[0] for part in payload[0] if part and part[0])
+        return translated or text
+    except Exception:
+        return text
+
 def get_all_known_skills(jobs):
     """Extracts all unique skills from the provided job list AND the base skills dictionary."""
     all_skills = set()
@@ -124,10 +180,13 @@ def get_all_known_skills(jobs):
 
 def extract_keywords(text):
     """Extracts keywords from text based on a known list of skills."""
-    all_known_skills = get_all_known_skills(load_jobs_data())
-    words = re.findall(r'\b[a-zA-Z]+\b', text.lower())
-    keywords = [w for w in words if w in all_known_skills]
-    return list(set(keywords))
+    normalized_text = normalize_skill_phrase(text)
+    all_known_skills = sorted(get_all_known_skills(load_jobs_data()), key=len, reverse=True)
+    keywords = []
+    for skill in all_known_skills:
+        if skill_present_in_text(skill, normalized_text):
+            keywords.append(normalize_skill_phrase(skill))
+    return sorted(set(keywords))
 
 def suggest_job_role(keywords):
     """Suggests a job role based on extracted keywords."""
@@ -159,33 +218,84 @@ def suggest_job_role(keywords):
 
     return list(predicted_roles)
 
-def fetch_jobs(predicted_roles, keywords):
-    """Fetch jobs from a local JSON file based on predicted roles and keywords."""
+def fetch_jobs(predicted_roles, keywords, text=""):
+    """Fetch jobs from the local catalog with honest match percentages and skill gaps."""
     jobs_data = load_jobs_data()
     recommended_jobs = []
-    seen_urls = set()
+    seen_keys = set()
+    normalized_keywords = {normalize_skill_phrase(skill) for skill in keywords}
+    normalized_text = normalize_skill_phrase(text)
+
+    role_scores = {}
+    if predicted_roles and isinstance(predicted_roles[0], dict):
+        role_scores = {item['role']: float(item.get('match_percentage', 0)) for item in predicted_roles}
+    else:
+        role_scores = {role: 0.0 for role in predicted_roles}
 
     for job in jobs_data:
-        title = job.get("title", "").lower()
-        title_match = any(role.lower() in title for role in predicted_roles)
-        
-        job_skills = {s.lower() for s in job.get("skills", [])}
-        skill_overlap = len(job_skills.intersection(set(keywords)))
-        
-        if (title_match or skill_overlap > 0) and job.get("url") not in seen_urls:
-            job["match_score"] = skill_overlap
-            # Generate search URLs for actual job sites using only job titles (no company names)
-            job_title = job.get("title", "")
-            location = job.get("location", "India")
-            # Create Google Jobs search URL with job title only
-            search_query = f"{job_title} jobs in {location}".replace(" ", "+")
-            job["url"] = f"https://www.google.com/search?ibp=htl;jobs&q={search_query}"
-            # Set a generic company name for display
-            job["company_name"] = "Multiple Companies"
-            recommended_jobs.append(job)
-            seen_urls.add(job.get("url"))
+        title = job.get("title", "")
+        title_lower = title.lower()
+        company_name = job.get("company") or job.get("company_name") or "Undisclosed Company"
+        location = job.get("location", "India")
+        job_skills = [normalize_skill_phrase(skill) for skill in job.get("skills", []) if normalize_skill_phrase(skill)]
 
-    recommended_jobs.sort(key=lambda x: x.get("match_score", 0), reverse=True)
+        matched_skills = [
+            skill for skill in job_skills
+            if skill in normalized_keywords or skill_present_in_text(skill, normalized_text)
+        ]
+        missing_skills = [skill for skill in job_skills if skill not in matched_skills]
+        skill_match_pct = round((len(matched_skills) / len(job_skills)) * 100, 1) if job_skills else 0.0
+
+        title_role_score = 0.0
+        for role, role_score in role_scores.items():
+            role_tokens = {
+                token for token in re.findall(r'[a-z]+', role.lower())
+                if token not in {'developer', 'engineer', 'specialist', 'representative'}
+            }
+            title_tokens = set(re.findall(r'[a-z]+', title_lower))
+            token_overlap = len(role_tokens.intersection(title_tokens))
+            if role.lower() in title_lower or token_overlap > 0:
+                title_role_score = max(title_role_score, role_score)
+
+        overall_match = round(min(100.0, (skill_match_pct * 0.75) + (title_role_score * 0.25)), 1)
+        if overall_match <= 0:
+            continue
+
+        original_url = (job.get("url") or "").strip()
+        parsed_host = urlparse(original_url).netloc.lower() if original_url else ""
+        placeholder_url = not original_url or parsed_host.endswith("example.com")
+        if placeholder_url:
+            search_query = quote_plus(f"{title} {company_name} {location} jobs")
+            job_url = f"https://www.google.com/search?ibp=htl;jobs&q={search_query}"
+            action_label = "Search job"
+        else:
+            job_url = original_url
+            action_label = "Open job"
+
+        unique_key = f"{title}|{company_name}|{location}"
+        if unique_key in seen_keys:
+            continue
+
+        recommended_jobs.append({
+            "title": title,
+            "company_name": company_name,
+            "location": location,
+            "salary": job.get("salary"),
+            "sector": job.get("sector"),
+            "description": job.get("description"),
+            "skills": job.get("skills", []),
+            "matched_skills": matched_skills,
+            "missing_skills": missing_skills[:6],
+            "match_score": overall_match,
+            "skill_match_score": skill_match_pct,
+            "role_alignment_score": round(title_role_score, 1),
+            "url": job_url,
+            "is_live_posting": not placeholder_url,
+            "action_label": action_label,
+        })
+        seen_keys.add(unique_key)
+
+    recommended_jobs.sort(key=lambda x: (x.get("match_score", 0), x.get("skill_match_score", 0)), reverse=True)
     return recommended_jobs[:5]
 
 def get_recommendation_label(score):
@@ -498,6 +608,7 @@ def get_comprehensive_skill_recommendations(role, matched_skills, missing_skills
         'Udemy': 'https://www.udemy.com',
         'Coursera': 'https://www.coursera.org',
         'edX': 'https://www.edx.org',
+        'Unacademy': 'https://unacademy.com',
         'LinkedIn Learning': 'https://www.linkedin.com/learning',
         'Pluralsight': 'https://www.pluralsight.com',
         'Skillshare': 'https://www.skillshare.com'
@@ -520,7 +631,7 @@ def get_comprehensive_skill_recommendations(role, matched_skills, missing_skills
         'React': {'provider': 'Udemy', 'search_query': 'react js'},
         'Angular': {'provider': 'Udemy', 'search_query': 'angular'},
         'Vue.js': {'provider': 'Udemy', 'search_query': 'vue js'},
-        'Django': {'provider': 'Udemy', 'search_query': 'django python'},
+        'Django': {'provider': 'Unacademy', 'search_query': 'django python backend'},
         'Flask': {'provider': 'Udemy', 'search_query': 'flask python'},
         'Spring Boot': {'provider': 'Udemy', 'search_query': 'spring boot'},
         'Node.js': {'provider': 'Udemy', 'search_query': 'node js'},
@@ -544,13 +655,13 @@ def get_comprehensive_skill_recommendations(role, matched_skills, missing_skills
         'Elasticsearch': {'provider': 'Udemy', 'search_query': 'elasticsearch'},
         
         # Cloud Platforms
-        'AWS': {'provider': 'Udemy', 'search_query': 'aws certified'},
+        'AWS': {'provider': 'Unacademy', 'search_query': 'aws cloud practitioner'},
         'Azure': {'provider': 'Udemy', 'search_query': 'microsoft azure'},
         'Google Cloud': {'provider': 'Coursera', 'search_query': 'google cloud platform'},
         
         # DevOps Tools
         'Git': {'provider': 'Udemy', 'search_query': 'git github'},
-        'Docker': {'provider': 'Udemy', 'search_query': 'docker'},
+        'Docker': {'provider': 'Unacademy', 'search_query': 'docker containers devops'},
         'Kubernetes': {'provider': 'Udemy', 'search_query': 'kubernetes'},
         'Jenkins': {'provider': 'Udemy', 'search_query': 'jenkins'},
         
@@ -850,6 +961,8 @@ def generate_course_links(missing_skills, skill_course_mapping, course_providers
             search_url = f"{provider_url}/search?query={search_query}"
         elif provider == 'edX':
             search_url = f"{provider_url}/search?q={search_query}"
+        elif provider == 'Unacademy':
+            search_url = f"{provider_url}/search?query={search_query}"
         elif provider == 'LinkedIn Learning':
             search_url = f"{provider_url}/search?keywords={search_query}"
         elif provider == 'Pluralsight':
@@ -2098,6 +2211,31 @@ def init_db():
             FOREIGN KEY (resume_id) REFERENCES generated_resumes (id)
         )
     ''')
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS resume_analyses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            source_type TEXT NOT NULL,
+            source_name TEXT,
+            source_ref TEXT,
+            resume_score REAL,
+            analysis_json TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users (id)
+        )
+    ''')
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS chat_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            role TEXT NOT NULL CHECK (role IN ('user', 'bot')),
+            content TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users (id)
+        )
+    ''')
     
     # Check for and create the admin user if it doesn't exist
     cursor.execute('SELECT email FROM users WHERE email = ?', ('admin@rezum.ai',))
@@ -2114,8 +2252,18 @@ def init_db():
 
 # --- Flask App Initialization ---
 
+from flask_cors import CORS
+
 app = Flask(__name__)
+CORS(app)
 app.config['SECRET_KEY'] = secrets.token_hex(16)
+app.config['MAIL_HOST'] = os.getenv('MAIL_HOST', 'smtp.gmail.com')
+app.config['MAIL_PORT'] = int(os.getenv('MAIL_PORT', '587'))
+app.config['MAIL_USERNAME'] = os.getenv('MAIL_USERNAME', 'careevo.mail@gmail.com')
+app.config['MAIL_PASSWORD'] = os.getenv('MAIL_PASSWORD', 'dncc kqiq ceqn wuxn')
+app.config['MAIL_USE_TLS'] = os.getenv('MAIL_USE_TLS', 'true').lower() in {'1', 'true', 'yes', 'on'}
+app.config['MAIL_FROM'] = os.getenv('MAIL_FROM', app.config['MAIL_USERNAME'])
+app.config['MAIL_FROM_NAME'] = os.getenv('MAIL_FROM_NAME', 'Careevo')
 
 def get_db_connection():
     """Create and return a database connection with row factory."""
@@ -2153,7 +2301,361 @@ SECURITY_QUESTIONS = [
     "What was your childhood nickname?"
 ]
 
+DEFAULT_SECURITY_QUESTION = "Email OTP verification"
+DEFAULT_SECURITY_ANSWER = "email-otp"
+RESET_OTP_EXPIRY_MINUTES = 10
+
 ALLOWED_EXTENSIONS = {'pdf', 'doc', 'docx'}
+
+
+def clear_reset_session():
+    """Remove all temporary forgot-password session keys."""
+    for key in ('reset_email', 'reset_otp_hash', 'reset_otp_expires_at', 'reset_otp_verified'):
+        session.pop(key, None)
+
+
+def build_analysis_snapshot(text, timestamp=None, source_name=None):
+    """Create a reusable dashboard analysis payload from resume text.
+    Uses the universal resume_intelligence engine when available.
+    """
+    if not text:
+        return None
+
+    # ── Use new universal engine if loaded ───────────────────────────────────
+    if INTELLIGENCE_ENGINE_ACTIVE:
+        analysis = full_resume_analysis(text)
+    else:
+        keywords = extract_keywords(text)
+        analysis = comprehensive_ats_analysis(text, keywords)
+        analysis['keywords'] = keywords
+        analysis.setdefault('improvements', analysis.get('improvement_feedback', []))
+
+    top_roles = analysis.get('job_matches', [])
+    top_role_names = [r['role'] for r in top_roles[:3]]
+    primary_role = top_role_names[0] if top_role_names else 'General Professional'
+    keywords = analysis.get('keywords', [])
+
+    return {
+        "keywords":             keywords,
+        "predicted_role":       analysis.get('predicted_role', ', '.join(top_role_names)),
+        "predicted_roles":      top_role_names,
+        "jobs":                 fetch_jobs(top_roles, keywords, text),
+        "timestamp":            timestamp,
+        "source_name":          source_name,
+        "resume_score":         analysis.get('ats_score', 0),
+        "improvement_feedback": analysis.get('improvement_feedback', []),
+        "recommendation_label": get_recommendation_label(analysis.get('ats_score', 0)),
+        "job_matches":          top_roles,
+        "keyword_analysis":     analysis.get('keyword_analysis', {}),
+        "skill_gaps":           analysis.get('skill_gaps', {}),
+        "quantified_suggestions": analysis.get('quantified_suggestions', []),
+        "summary_suggestions":  analysis.get('summary_suggestions', ''),
+        "skills_suggestions":   analysis.get('skills_suggestions', ''),
+        "ats_explanation":      analysis.get('ats_explanation', ''),
+        "ai_executive_summary": analysis.get('ai_executive_summary', ''),
+        "top_strength":         analysis.get('top_strength', ''),
+        "key_improvement":      analysis.get('key_improvement', ''),
+        "job_roles_data":       analysis.get('job_roles_data', []),
+        "primary_role_gap":     analysis.get('skill_gaps', {}).get(primary_role),
+        # ── NEW overview fields ──
+        "strengths":            analysis.get('strengths', []),
+        "weaknesses":           analysis.get('weaknesses', []),
+        "how_to_improve":       analysis.get('how_to_improve', []),
+        "ats_breakdown":        analysis.get('ats_breakdown', {}),
+        "education_level":      analysis.get('education_level', ''),
+        "years_experience":     analysis.get('years_experience', 0),
+        "seniority_level":      analysis.get('seniority_level', ''),
+    }
+
+
+def save_resume_analysis(user_id, source_type, source_name, source_ref, analysis_payload):
+    """Persist an analysis snapshot so it survives logout/login."""
+    conn = sqlite3.connect('rezumai.db')
+    cursor = conn.cursor()
+    cursor.execute(
+        '''
+        INSERT INTO resume_analyses (user_id, source_type, source_name, source_ref, resume_score, analysis_json)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ''',
+        (
+            user_id,
+            source_type,
+            source_name,
+            str(source_ref) if source_ref is not None else None,
+            analysis_payload.get('resume_score'),
+            json.dumps(analysis_payload)
+        )
+    )
+    conn.commit()
+    conn.close()
+
+
+def save_chat_message(user_id, role, content):
+    """Persist chat messages for the logged-in user."""
+    conn = sqlite3.connect('rezumai.db')
+    cursor = conn.cursor()
+    cursor.execute(
+        'INSERT INTO chat_history (user_id, role, content) VALUES (?, ?, ?)',
+        (user_id, role, content)
+    )
+    conn.commit()
+    conn.close()
+
+
+def send_password_reset_otp(email, otp):
+    """Send a password reset OTP through the configured SMTP server."""
+    mail_username = app.config.get('MAIL_USERNAME')
+    mail_password = app.config.get('MAIL_PASSWORD')
+    mail_from = app.config.get('MAIL_FROM')
+
+    if not mail_username or not mail_password or not mail_from:
+        raise RuntimeError('Mail server is not configured. Set MAIL_USERNAME, MAIL_PASSWORD, and MAIL_FROM.')
+
+    message = EmailMessage()
+    message['Subject'] = 'Careevo password reset OTP'
+    message['From'] = f"{app.config.get('MAIL_FROM_NAME', 'Careevo')} <{mail_from}>"
+    message['To'] = email
+    logo_cid = 'careevo-logo'
+    message.set_content(
+        "\n".join([
+            "Careevo password reset",
+            "",
+            f"Your one-time password is: {otp}",
+            f"This OTP expires in {RESET_OTP_EXPIRY_MINUTES} minutes.",
+            "",
+            "If you did not request a password reset, you can ignore this email.",
+            "",
+            "Careevo",
+            "Resume intelligence for faster hiring",
+        ])
+    )
+    message.add_alternative(
+        f"""
+        <!DOCTYPE html>
+        <html lang="en">
+          <body style="margin:0;padding:0;background-color:#f3fbf6;font-family:Arial,Helvetica,sans-serif;color:#1f2b27;">
+            <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:linear-gradient(180deg,#f8fff9 0%,#eef9f1 100%);padding:32px 12px;">
+              <tr>
+                <td align="center">
+                  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:620px;background:#ffffff;border:1px solid #dff2e7;border-radius:24px;overflow:hidden;box-shadow:0 18px 40px rgba(31,43,39,0.08);">
+                    <tr>
+                      <td style="padding:0;background:linear-gradient(135deg,#39b887 0%,#4ec998 100%);height:8px;font-size:0;line-height:0;">&nbsp;</td>
+                    </tr>
+                    <tr>
+                      <td style="padding:32px 36px 18px 36px;text-align:center;">
+                        <img src="cid:{logo_cid}" alt="Careevo logo" style="display:block;margin:0 auto 16px auto;max-width:220px;height:auto;" />
+                        <div style="font-size:13px;line-height:20px;color:#5f6f68;letter-spacing:0.04em;text-transform:uppercase;font-weight:700;">Password Reset Verification</div>
+                        <h1 style="margin:12px 0 12px 0;font-size:32px;line-height:38px;color:#1f2b27;">Your Careevo OTP</h1>
+                        <p style="margin:0 auto;max-width:460px;font-size:16px;line-height:26px;color:#4f635b;">
+                          Use the one-time password below to reset your Careevo account password. This code expires in
+                          <strong>{RESET_OTP_EXPIRY_MINUTES} minutes</strong>.
+                        </p>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td style="padding:8px 36px 0 36px;">
+                        <div style="background:#f6fff9;border:1px solid #cfeedd;border-radius:20px;padding:24px 20px;text-align:center;">
+                          <div style="font-size:13px;line-height:20px;color:#5f6f68;text-transform:uppercase;letter-spacing:0.18em;font-weight:700;margin-bottom:10px;">One-Time Password</div>
+                          <div style="font-size:42px;line-height:46px;font-weight:800;letter-spacing:0.28em;color:#2b8d68;text-indent:0.28em;">{otp}</div>
+                        </div>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td style="padding:24px 36px 0 36px;">
+                        <div style="background:#fff8e8;border:1px solid #fde7b2;border-radius:16px;padding:16px 18px;font-size:14px;line-height:22px;color:#7c5b10;">
+                          If you did not request this reset, you can safely ignore this email. Your password will remain unchanged.
+                        </div>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td style="padding:24px 36px 32px 36px;">
+                        <div style="border-top:1px solid #e7f4ec;padding-top:20px;text-align:center;">
+                          <div style="font-size:15px;line-height:24px;font-weight:700;color:#1f2b27;">Careevo</div>
+                          <div style="font-size:13px;line-height:22px;color:#6a7b73;">Resume intelligence for faster hiring</div>
+                        </div>
+                      </td>
+                    </tr>
+                  </table>
+                </td>
+              </tr>
+            </table>
+          </body>
+        </html>
+        """,
+        subtype='html'
+    )
+
+    logo_path = Path(app.root_path) / 'static' / 'images' / 'careevo-logo.png'
+    if logo_path.exists():
+        with logo_path.open('rb') as logo_file:
+            message.get_payload()[-1].add_related(
+                logo_file.read(),
+                maintype='image',
+                subtype='png',
+                cid=f'<{logo_cid}>',
+                filename='careevo-logo.png'
+            )
+
+    with smtplib.SMTP(app.config['MAIL_HOST'], app.config['MAIL_PORT']) as smtp:
+        if app.config.get('MAIL_USE_TLS', True):
+            smtp.starttls()
+        smtp.login(mail_username, mail_password)
+        smtp.send_message(message)
+
+
+def render_react_app(page_name):
+    return render_template(
+        'react_app.html',
+        app_config={
+            'page': page_name,
+            'isAuthenticated': 'user_id' in session,
+            'isAdmin': bool(session.get('is_admin')),
+            'userName': session.get('user_name', ''),
+            'securityQuestions': SECURITY_QUESTIONS,
+        }
+    )
+
+
+def build_dashboard_payload(user_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        'SELECT rating, suggestion, admin_reply, created_at, replied_at FROM feedback WHERE user_id = ? ORDER BY created_at DESC',
+        (user_id,)
+    )
+    user_feedback = cursor.fetchall()
+
+    cursor.execute(
+        'SELECT filepath, uploaded_at FROM uploaded_resumes WHERE user_id = ? ORDER BY uploaded_at DESC LIMIT 1',
+        (user_id,)
+    )
+    last_resume = cursor.fetchone()
+
+    cursor.execute(
+        'SELECT id, resume_data, created_at FROM generated_resumes WHERE user_id = ? ORDER BY created_at DESC LIMIT 1',
+        (user_id,)
+    )
+    latest_resume = cursor.fetchone()
+
+    generated_resume_data = None
+    if latest_resume:
+        resume_id, resume_json, created_at = latest_resume['id'], latest_resume['resume_data'], latest_resume['created_at']
+        generated_resume_data = {
+            'id': resume_id,
+            'data': json.loads(resume_json),
+            'created_at': created_at
+        }
+
+    cursor.execute(
+        'SELECT id, source_name, analysis_json, created_at FROM resume_analyses WHERE user_id = ? ORDER BY created_at DESC LIMIT 6',
+        (user_id,)
+    )
+    saved_analyses = cursor.fetchall()
+
+    if not saved_analyses and last_resume:
+        filepath, uploaded_at = last_resume['filepath'], last_resume['uploaded_at']
+        text = extract_text_from_resume(filepath)
+        analysis_snapshot = build_analysis_snapshot(text, uploaded_at, last_resume['filepath'].split(os.sep)[-1]) if text else None
+        if analysis_snapshot:
+            save_resume_analysis(user_id, 'uploaded_resume', analysis_snapshot.get('source_name'), filepath, analysis_snapshot)
+            cursor.execute(
+                'SELECT id, source_name, analysis_json, created_at FROM resume_analyses WHERE user_id = ? ORDER BY created_at DESC LIMIT 6',
+                (user_id,)
+            )
+            saved_analyses = cursor.fetchall()
+    elif not saved_analyses and generated_resume_data:
+        try:
+            pdf_buffer = generate_ats_pdf(generated_resume_data['data'])
+            pdf_buffer.seek(0)
+
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp_file:
+                tmp_file.write(pdf_buffer.getvalue())
+                tmp_filepath = tmp_file.name
+
+            text = extract_text_from_resume(tmp_filepath)
+            os.unlink(tmp_filepath)
+            analysis_snapshot = build_analysis_snapshot(text, generated_resume_data['created_at'], 'Generated resume') if text else None
+            if analysis_snapshot:
+                save_resume_analysis(user_id, 'generated_resume', 'Generated resume', generated_resume_data['id'], analysis_snapshot)
+                cursor.execute(
+                    'SELECT id, source_name, analysis_json, created_at FROM resume_analyses WHERE user_id = ? ORDER BY created_at DESC LIMIT 6',
+                    (user_id,)
+                )
+                saved_analyses = cursor.fetchall()
+        except Exception as e:
+            print(f"Error analyzing generated resume: {e}")
+
+    current_analysis_id = session.get('current_analysis_id')
+    last_analysis = None
+    analysis_history = []
+    for row in saved_analyses:
+        payload = json.loads(row['analysis_json'])
+        payload['analysis_id'] = row['id']
+        payload['timestamp'] = payload.get('timestamp') or row['created_at']
+        payload['source_name'] = payload.get('source_name') or row['source_name'] or 'Resume analysis'
+        analysis_history.append(payload)
+
+    if current_analysis_id:
+        for item in analysis_history:
+            if item.get('analysis_id') == current_analysis_id:
+                last_analysis = item
+                break
+
+    cursor.execute(
+        'SELECT role, content, created_at FROM chat_history WHERE user_id = ? ORDER BY created_at DESC LIMIT 20',
+        (user_id,)
+    )
+    chat_history_rows = list(reversed(cursor.fetchall()))
+
+    conn.close()
+
+    return {
+        'user_name': session.get('user_name', ''),
+        'chatLanguage': session.get('chat_language', 'en-US'),
+        'user_feedback': [dict(row) for row in user_feedback],
+        'last_analysis': last_analysis,
+        'has_saved_history': bool(analysis_history),
+        'analysis_history': [
+            {
+                'analysis_id': item.get('analysis_id'),
+                'resume_score': item.get('resume_score'),
+                'predicted_role': item.get('predicted_role'),
+                'predicted_roles': item.get('predicted_roles', []),
+                'timestamp': item.get('timestamp'),
+                'source_name': item.get('source_name'),
+            }
+            for item in analysis_history
+        ],
+        'chat_history': [dict(row) for row in chat_history_rows],
+        'generated_resume': generated_resume_data
+    }
+
+
+def build_resume_builder_payload(user_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        'SELECT id, resume_data, created_at FROM generated_resumes WHERE user_id = ? ORDER BY created_at DESC LIMIT 1',
+        (user_id,)
+    )
+    latest_resume = cursor.fetchone()
+    conn.close()
+
+    return {
+        'saved_resume': {
+            'id': latest_resume['id'],
+            'data': json.loads(latest_resume['resume_data']),
+            'created_at': latest_resume['created_at']
+        } if latest_resume else None,
+        'recommended_skills_by_degree': {
+            'BCA': get_recommended_skills_by_degree('BCA'),
+            'B.Tech': get_recommended_skills_by_degree('B.Tech'),
+            'MCA': get_recommended_skills_by_degree('MCA'),
+            'MBA': get_recommended_skills_by_degree('MBA')
+        }
+    }
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
@@ -2174,92 +2676,204 @@ def index():
         if session.get('is_admin'):
             return redirect(url_for('admin_dashboard'))
         return redirect(url_for('dashboard'))
-    return render_template('landing.html')
+    return render_react_app('landing')
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
+    if request.method == 'GET':
+        if 'user_id' in session:
+            return redirect(url_for('admin_dashboard' if session.get('is_admin') else 'dashboard'))
+        return render_react_app('login')
+
     if request.method == 'POST':
-        email = request.form['email']
-        password = request.form['password']
+        # Support both form data and JSON data
+        data = request.get_json(silent=True) or {}
+        is_json = request.is_json or request.headers.get('Accept') == 'application/json'
+        email = (request.form.get('email') or data.get('email') or '').strip().lower()
+        password = request.form.get('password') or data.get('password') or ''
+
+        if not email or not password:
+            if is_json:
+                return jsonify({'success': False, 'message': 'Email and password are required.'}), 400
+            flash('Email and password are required.', 'danger')
+            return render_react_app('login')
+
         conn = sqlite3.connect('rezumai.db')
         cursor = conn.cursor()
         cursor.execute('SELECT id, name, password_hash, is_admin FROM users WHERE email = ?', (email,))
         user = cursor.fetchone()
         conn.close()
+
         if user and check_password_hash(user[2], password):
             session['user_id'] = user[0]
             session['user_email'] = email
             session['user_name'] = user[1]
             session['is_admin'] = bool(user[3])
+            session['current_analysis_id'] = None
+            session['chat_language'] = 'en-US'
             log_login(session['user_id'])
+            redirect_url = '/admin_dashboard' if session['is_admin'] else '/dashboard'
+            
+            if is_json:
+                return jsonify({'success': True, 'redirect': redirect_url})
+                
             flash('Login successful!', 'success')
             return redirect(url_for('admin_dashboard' if session['is_admin'] else 'dashboard'))
         else:
+            if is_json:
+                return jsonify({'success': False, 'message': 'Invalid email or password!'}), 401
+                
             flash('Invalid email or password!', 'danger')
-    return render_template('login.html', security_questions=SECURITY_QUESTIONS)
+    return render_react_app('login')
 
 @app.route('/register', methods=['GET', 'POST'])
 def register():
-    if request.method == 'POST':
-        name = request.form['name'].strip()
-        email = request.form['email'].strip().lower()
-        password = request.form['password']
-        confirm_password = request.form['confirm_password']
-        security_question = request.form['security_question'].strip()
-        security_answer = request.form['security_answer'].strip()
+    if request.method == 'GET':
+        if 'user_id' in session:
+            return redirect(url_for('admin_dashboard' if session.get('is_admin') else 'dashboard'))
+        return render_react_app('register')
 
+    if request.method == 'POST':
+        data = request.get_json(silent=True) or {}
+        is_json = request.is_json or request.headers.get('Accept') == 'application/json'
+        name = (request.form.get('name') or data.get('name') or '').strip()
+        email = (request.form.get('email') or data.get('email') or '').strip().lower()
+        password = request.form.get('password') or data.get('password') or ''
+        confirm_password = request.form.get('confirm_password') or data.get('confirm_password') or ''
         if not name or len(name) < 2:
+            if is_json:
+                return jsonify({'success': False, 'message': 'Please enter a valid full name (min 2 characters).'}), 400
             flash('Please enter a valid full name (min 2 characters).', 'danger')
             return render_template('register.html', security_questions=SECURITY_QUESTIONS)
 
         email_regex = r'^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'
         if not re.match(email_regex, email):
+            if is_json:
+                return jsonify({'success': False, 'message': 'Please enter a valid email address.'}), 400
             flash('Please enter a valid email address.', 'danger')
             return render_template('register.html', security_questions=SECURITY_QUESTIONS)
 
         if password != confirm_password:
+            if is_json:
+                return jsonify({'success': False, 'message': 'Passwords do not match!'}), 400
             flash('Passwords do not match!', 'danger')
             return render_template('register.html', security_questions=SECURITY_QUESTIONS)
 
         if len(password) < 6 or not re.search(r'[A-Za-z]', password) or not re.search(r'\d', password):
+            if is_json:
+                return jsonify({'success': False, 'message': 'Password must be at least 6 characters and include letters and numbers.'}), 400
             flash('Password must be at least 6 characters and include letters and numbers.', 'danger')
             return render_template('register.html', security_questions=SECURITY_QUESTIONS)
 
-        if not security_question:
-            flash('Please select a security question.', 'danger')
-            return render_template('register.html', security_questions=SECURITY_QUESTIONS)
-
-        if not security_answer or len(security_answer) < 2:
-            flash('Please provide a valid security answer.', 'danger')
-            return render_template('register.html', security_questions=SECURITY_QUESTIONS)
         conn = sqlite3.connect('rezumai.db')
         cursor = conn.cursor()
         
         password_hash = generate_password_hash(password)
-        security_answer_hash = generate_password_hash(security_answer.lower())
+        security_answer_hash = generate_password_hash(DEFAULT_SECURITY_ANSWER)
         
         try:
             cursor.execute('''
                 INSERT INTO users (email, name, password_hash, security_question, security_answer_hash)
                 VALUES (?, ?, ?, ?, ?)
-            ''', (email, name, password_hash, security_question, security_answer_hash))
+            ''', (email, name, password_hash, DEFAULT_SECURITY_QUESTION, security_answer_hash))
             
             conn.commit()
             conn.close()
+            if is_json:
+                return jsonify({'success': True, 'message': 'Registration successful! Please log in.'})
             flash('Registration successful! Please login.', 'success')
             return redirect(url_for('login'))
             
         except sqlite3.IntegrityError:
             conn.rollback()
             conn.close()
+            if is_json:
+                return jsonify({'success': False, 'message': 'Email already registered! Please use a different email or log in.'}), 409
             flash('Email already registered! Please use a different email or log in.', 'danger')
             return render_template('register.html', security_questions=SECURITY_QUESTIONS)
             
-    return render_template('register.html', security_questions=SECURITY_QUESTIONS)
+    return render_react_app('register')
 
 @app.route('/forgot_password', methods=['GET', 'POST'])
 def forgot_password():
+    if request.method == 'GET':
+        return render_react_app('forgot_password')
+
     if request.method == 'POST':
+        data = request.get_json(silent=True) or {}
+        is_json = request.is_json or request.headers.get('Accept') == 'application/json'
+        if is_json:
+            step = str(data.get('step', '1'))
+            if step == '1':
+                email = (data.get('email') or '').strip().lower()
+                if not email:
+                    return jsonify({'success': False, 'message': 'Email is required.'}), 400
+                conn = sqlite3.connect('rezumai.db')
+                cursor = conn.cursor()
+                cursor.execute('SELECT email FROM users WHERE email = ?', (email,))
+                user = cursor.fetchone()
+                conn.close()
+                if user:
+                    otp = f"{secrets.randbelow(1000000):06d}"
+                    expiry_time = datetime.utcnow() + timedelta(minutes=RESET_OTP_EXPIRY_MINUTES)
+                    try:
+                        send_password_reset_otp(email, otp)
+                    except Exception as exc:
+                        logging.exception("Failed to send password reset OTP to %s", email)
+                        return jsonify({'success': False, 'message': 'Could not send OTP email. Please check mail settings and try again.'}), 500
+
+                    session['reset_email'] = email
+                    session['reset_otp_hash'] = generate_password_hash(otp)
+                    session['reset_otp_expires_at'] = expiry_time.isoformat()
+                    session['reset_otp_verified'] = False
+                    return jsonify({
+                        'success': True,
+                        'step': 2,
+                        'email': email,
+                        'message': f'We sent a 6-digit OTP to {email}.'
+                    })
+                return jsonify({'success': False, 'message': 'Email not found!'}), 404
+            if step == '2':
+                email = session.get('reset_email') or (data.get('email') or '').strip().lower()
+                otp = (data.get('otp') or '').strip()
+                expiry_raw = session.get('reset_otp_expires_at')
+                otp_hash = session.get('reset_otp_hash')
+                if not email or not otp_hash or not expiry_raw:
+                    clear_reset_session()
+                    return jsonify({'success': False, 'message': 'Reset session expired. Please request a new OTP.'}), 400
+                try:
+                    expiry_time = datetime.fromisoformat(expiry_raw)
+                except ValueError:
+                    clear_reset_session()
+                    return jsonify({'success': False, 'message': 'Reset session expired. Please request a new OTP.'}), 400
+                if datetime.utcnow() > expiry_time:
+                    clear_reset_session()
+                    return jsonify({'success': False, 'message': 'OTP expired. Please request a new one.'}), 400
+                if check_password_hash(otp_hash, otp):
+                    session['reset_email'] = email
+                    session['reset_otp_verified'] = True
+                    return jsonify({'success': True, 'step': 3, 'email': email})
+                return jsonify({'success': False, 'message': 'Invalid OTP. Please try again.'}), 400
+            if step == '3':
+                email = session.get('reset_email') or (data.get('email') or '').strip().lower()
+                new_password = data.get('new_password') or ''
+                confirm_password = data.get('confirm_password') or ''
+                if not session.get('reset_otp_verified') or not email:
+                    clear_reset_session()
+                    return jsonify({'success': False, 'message': 'Please verify your OTP before resetting the password.'}), 400
+                if new_password != confirm_password:
+                    return jsonify({'success': False, 'message': 'Passwords do not match!'}), 400
+                if len(new_password) < 6 or not re.search(r'[A-Za-z]', new_password) or not re.search(r'\d', new_password):
+                    return jsonify({'success': False, 'message': 'Password must be at least 6 characters and include letters and numbers.'}), 400
+                conn = sqlite3.connect('rezumai.db')
+                cursor = conn.cursor()
+                new_password_hash = generate_password_hash(new_password)
+                cursor.execute('UPDATE users SET password_hash = ? WHERE email = ?', (new_password_hash, email))
+                conn.commit()
+                conn.close()
+                clear_reset_session()
+                return jsonify({'success': True, 'message': 'Password updated successfully! Please login.'})
+
         step = request.form.get('step', '1')
         if step == '1':
             email = request.form['email']
@@ -2302,7 +2916,7 @@ def forgot_password():
             session.pop('reset_email', None)
             flash('Password updated successfully! Please login.', 'success')
             return redirect(url_for('login'))
-    return render_template('forgot_password.html', step=1)
+    return render_react_app('forgot_password')
 
 @app.route('/save_resume', methods=['POST'])
 def save_resume():
@@ -2439,65 +3053,37 @@ def chat():
     
     data = request.get_json()
     message = data.get('message', '').strip()
+    language = (data.get('language') or session.get('chat_language') or 'en-US').strip()
     
     if not message:
         return jsonify({'success': False, 'message': 'Please provide a message'})
     
-    # Get user's latest resume analysis for context
     user_id = session['user_id']
     conn = sqlite3.connect('rezumai.db')
     cursor = conn.cursor()
-    
-    # Get latest uploaded resume analysis
-    cursor.execute('SELECT filepath, uploaded_at FROM uploaded_resumes WHERE user_id = ? ORDER BY uploaded_at DESC LIMIT 1', (user_id,))
-    last_resume = cursor.fetchone()
-    
-    # Also check for generated resumes if no uploaded resume
-    cursor.execute('SELECT id, resume_data, created_at FROM generated_resumes WHERE user_id = ? ORDER BY created_at DESC LIMIT 1', (user_id,))
-    generated_resume = cursor.fetchone()
-    
+
+    cursor.execute(
+        'SELECT analysis_json FROM resume_analyses WHERE user_id = ? ORDER BY created_at DESC LIMIT 1',
+        (user_id,)
+    )
+    saved_analysis = cursor.fetchone()
     context = ""
-    if last_resume:
-        text = extract_text_from_resume(last_resume[0])
-        if text:
-            keywords = extract_keywords(text)
-            analysis = comprehensive_ats_analysis(text, keywords)
-            context = f"User's resume analysis: ATS score of {analysis['ats_score']}. Top job matches: {', '.join([match['role'] for match in analysis['job_matches'][:3]])}"
-    elif generated_resume:
-        # Analyze generated resume
-        try:
-            resume_data = json.loads(generated_resume[1])
-            # Generate a temporary PDF for analysis
-            pdf_buffer = generate_ats_pdf(resume_data)
-            pdf_buffer.seek(0)
-            
-            # Save temporarily to extract text
-            import tempfile
-            import os
-            with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp_file:
-                tmp_file.write(pdf_buffer.getvalue())
-                tmp_filepath = tmp_file.name
-            
-            # Extract text from the generated PDF
-            text = extract_text_from_resume(tmp_filepath)
-            
-            # Clean up temporary file
-            os.unlink(tmp_filepath)
-            
-            if text:
-                keywords = extract_keywords(text)
-                analysis = comprehensive_ats_analysis(text, keywords)
-                context = f"User's resume analysis: ATS score of {analysis['ats_score']}. Top job matches: {', '.join([match['role'] for match in analysis['job_matches'][:3]])}"
-        except Exception as e:
-            print(f"Error analyzing generated resume: {e}")
-            pass
+    if saved_analysis:
+        analysis = json.loads(saved_analysis[0])
+        top_roles = analysis.get('predicted_roles') or [match['role'] for match in analysis.get('job_matches', [])[:3]]
+        context = f"User's resume analysis: ATS score of {analysis.get('resume_score', 0)}. Top job matches: {', '.join(top_roles)}"
     
     conn.close()
     
     # Generate AI response based on message and context
     response = generate_ai_response(message, context)
+    plain_response = strip_html_tags(response)
+    translated_response = translate_text(plain_response, language)
+    session['chat_language'] = language
+    save_chat_message(user_id, 'user', message)
+    save_chat_message(user_id, 'bot', translated_response)
     
-    return jsonify({'success': True, 'response': response})
+    return jsonify({'success': True, 'response': translated_response, 'language': language})
 
 
 @app.route('/dashboard')
@@ -2505,130 +3091,12 @@ def dashboard():
     if 'user_id' not in session or session.get('is_admin'):
         return redirect(url_for('login'))
 
-    user_id = session['user_id']
-    conn = sqlite3.connect('rezumai.db')
-    cursor = conn.cursor()
+    payload = build_dashboard_payload(session['user_id'])
 
-    cursor.execute('SELECT rating, suggestion, admin_reply, created_at, replied_at FROM feedback WHERE user_id = ? ORDER BY created_at DESC', (user_id,))
-    user_feedback = cursor.fetchall()
-    
-    cursor.execute('SELECT filepath, uploaded_at FROM uploaded_resumes WHERE user_id = ? ORDER BY uploaded_at DESC LIMIT 1', (user_id,))
-    last_resume = cursor.fetchone()
+    if request.headers.get('Accept') == 'application/json' or request.path.endswith('/json'):
+        return jsonify(payload)
 
-    # Get latest generated resume data
-    cursor.execute('SELECT id, resume_data, created_at FROM generated_resumes WHERE user_id = ? ORDER BY created_at DESC LIMIT 1', (user_id,))
-    latest_resume = cursor.fetchone()
-    
-    generated_resume_data = None
-    if latest_resume:
-        resume_id, resume_json, created_at = latest_resume
-        generated_resume_data = {
-            'id': resume_id,
-            'data': json.loads(resume_json),
-            'created_at': created_at
-        }
-
-    last_analysis = None
-    if last_resume:
-        filepath = last_resume[0]
-        uploaded_at = last_resume[1]
-        text = extract_text_from_resume(filepath)
-        if text:  # Only analyze if text extraction was successful
-            keywords = extract_keywords(text)
-            
-            # Use comprehensive ATS analysis
-            comprehensive_analysis = comprehensive_ats_analysis(text, keywords)
-            
-            # Get jobs for top predicted roles
-            top_roles = [match['role'] for match in comprehensive_analysis['job_matches'][:3]]
-            jobs = fetch_jobs(top_roles, keywords)
-
-            last_analysis = {
-                "keywords": keywords,
-                "predicted_role": ", ".join(top_roles),
-                "jobs": jobs,
-                "timestamp": uploaded_at,
-                "resume_score": comprehensive_analysis['ats_score'],
-                "improvement_feedback": comprehensive_analysis['improvements'],
-                "recommendation_label": get_recommendation_label(comprehensive_analysis['ats_score']),
-                # Advanced analysis data
-                "job_matches": comprehensive_analysis['job_matches'],
-                "keyword_analysis": comprehensive_analysis['keyword_analysis'],
-                "skill_gaps": comprehensive_analysis['skill_gaps'],
-                "quantified_suggestions": comprehensive_analysis['quantified_suggestions'],
-                "summary_suggestions": comprehensive_analysis['summary_suggestions'],
-                "skills_suggestions": comprehensive_analysis['skills_suggestions'],
-                "ats_explanation": comprehensive_analysis['ats_explanation'],
-                # AI Feedback data
-                "ai_executive_summary": comprehensive_analysis.get('ai_executive_summary', 'Upload a resume to get personalized AI insights'),
-                "top_strength": comprehensive_analysis.get('top_strength', 'Analyze your resume to discover your strengths'),
-                "key_improvement": comprehensive_analysis.get('key_improvement', 'Upload your resume for improvement recommendations'),
-                "job_roles_data": comprehensive_analysis.get('job_roles_data', [])
-            }
-    elif generated_resume_data:  # If no uploaded resume, but there's a generated one
-        # Analyze the generated resume data
-        try:
-            # Generate a temporary PDF for analysis
-            pdf_buffer = generate_ats_pdf(generated_resume_data['data'])
-            pdf_buffer.seek(0)
-            
-            # Save temporarily to extract text
-            import tempfile
-            import os
-            with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp_file:
-                tmp_file.write(pdf_buffer.getvalue())
-                tmp_filepath = tmp_file.name
-            
-            # Extract text from the generated PDF
-            text = extract_text_from_resume(tmp_filepath)
-            
-            # Clean up temporary file
-            os.unlink(tmp_filepath)
-            
-            if text:  # Only analyze if text extraction was successful
-                keywords = extract_keywords(text)
-                
-                # Use comprehensive ATS analysis
-                comprehensive_analysis = comprehensive_ats_analysis(text, keywords)
-                
-                # Get jobs for top predicted roles
-                top_roles = [match['role'] for match in comprehensive_analysis['job_matches'][:3]]
-                jobs = fetch_jobs(top_roles, keywords)
-
-                last_analysis = {
-                    "keywords": keywords,
-                    "predicted_role": ", ".join(top_roles),
-                    "jobs": jobs,
-                    "timestamp": generated_resume_data['created_at'],
-                    "resume_score": comprehensive_analysis['ats_score'],
-                    "improvement_feedback": comprehensive_analysis['improvements'],
-                    "recommendation_label": get_recommendation_label(comprehensive_analysis['ats_score']),
-                    # Advanced analysis data
-                    "job_matches": comprehensive_analysis['job_matches'],
-                    "keyword_analysis": comprehensive_analysis['keyword_analysis'],
-                    "skill_gaps": comprehensive_analysis['skill_gaps'],
-                    "quantified_suggestions": comprehensive_analysis['quantified_suggestions'],
-                    "summary_suggestions": comprehensive_analysis['summary_suggestions'],
-                    "skills_suggestions": comprehensive_analysis['skills_suggestions'],
-                    "ats_explanation": comprehensive_analysis['ats_explanation'],
-                    # AI Feedback data
-                    "ai_executive_summary": comprehensive_analysis.get('ai_executive_summary', 'Upload a resume to get personalized AI insights'),
-                    "top_strength": comprehensive_analysis.get('top_strength', 'Analyze your resume to discover your strengths'),
-                    "key_improvement": comprehensive_analysis.get('key_improvement', 'Upload your resume for improvement recommendations'),
-                    "job_roles_data": comprehensive_analysis.get('job_roles_data', [])
-                }
-        except Exception as e:
-            print(f"Error analyzing generated resume: {e}")
-            pass  # Continue without analysis if there's an error
-
-    conn.close()
-
-    return render_template(
-        'dashboard.html',
-        user_feedback=user_feedback,
-        last_analysis=last_analysis,
-        generated_resume=generated_resume_data
-    )
+    return render_react_app('dashboard')
 
 @app.route('/admin')
 def admin_dashboard():
@@ -2900,46 +3368,11 @@ def admin_metrics():
 def resume_builder():
     if 'user_id' not in session:
         return redirect(url_for('login'))
-    
-    # Get user's existing resume data if any
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    # Check if user has any saved resumes
-    cursor.execute('SELECT * FROM resumes WHERE user_id = ?', (session['user_id'],))
-    resume = cursor.fetchone()
-    
-    resume_data = {
-        'personal_info': {},
-        'education': [],
-        'experience': [],
-        'skills': [],
-        'projects': [],
-        'certifications': [],
-        'achievements': []
-    }
-    
-    if resume:
-        # Get resume sections
-        cursor.execute('''
-            SELECT section_type, section_data 
-            FROM resume_sections 
-            WHERE resume_id = ?
-            ORDER BY display_order
-        ''', (resume['id'],))
-        
-        for section in cursor.fetchall():
-            section_data = json.loads(section['section_data'])
-            if section['section_type'] == 'personal':
-                resume_data['personal_info'] = section_data
-            else:
-                resume_data[f"{section['section_type']}s"].append(section_data)
-    
-    conn.close()
-    
-    return render_template('resume_builder.html', 
-                         resume=resume_data,
-                         resume_id=resume['id'] if resume else None)
+
+    if request.headers.get('Accept') == 'application/json':
+        return jsonify(build_resume_builder_payload(session['user_id']))
+
+    return render_react_app('resume_builder')
 
 @app.route('/upload_resume', methods=['POST'])
 def upload_resume():
@@ -2974,42 +3407,44 @@ def upload_resume():
         return jsonify({'success': False, 'message': 'This document does not appear to be a resume. Please upload a valid resume document.'})
 
 
-    keywords = extract_keywords(text)
-
-    # Use comprehensive ATS analysis
-    comprehensive_analysis = comprehensive_ats_analysis(text, keywords)
-    
-    # Get jobs for top predicted roles
-    top_roles = [match['role'] for match in comprehensive_analysis['job_matches'][:3]]
-    recommended_jobs = fetch_jobs(top_roles, keywords)
-
     conn = sqlite3.connect('rezumai.db')
     c = conn.cursor()
     c.execute(
         "INSERT INTO uploaded_resumes (user_id, filename, filepath) VALUES (?, ?, ?)",
         (user_id, filename, save_path)
     )
+    resume_id = c.lastrowid
     conn.commit()
     conn.close()
+
+    analysis_snapshot = build_analysis_snapshot(text, datetime.utcnow().isoformat(), filename)
+    save_resume_analysis(user_id, 'uploaded_resume', filename, resume_id, analysis_snapshot)
+    conn = sqlite3.connect('rezumai.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT id FROM resume_analyses WHERE user_id = ? ORDER BY id DESC LIMIT 1', (user_id,))
+    latest_analysis = cursor.fetchone()
+    conn.close()
+    if latest_analysis:
+        session['current_analysis_id'] = latest_analysis[0]
 
     return jsonify({
         "success": True,
         "message": "Resume uploaded successfully",
         "uploaded_filename": filename,
-        "keywords": keywords,
-        "predicted_role": top_roles,
-        "recommended_jobs": recommended_jobs,
-        "resume_score": comprehensive_analysis['ats_score'],
-        "improvement_feedback": comprehensive_analysis['improvements'],
-        "recommendation_label": get_recommendation_label(comprehensive_analysis['ats_score']),
+        "keywords": analysis_snapshot['keywords'],
+        "predicted_role": analysis_snapshot['predicted_roles'],
+        "recommended_jobs": analysis_snapshot['jobs'],
+        "resume_score": analysis_snapshot['resume_score'],
+        "improvement_feedback": analysis_snapshot['improvement_feedback'],
+        "recommendation_label": analysis_snapshot['recommendation_label'],
         # Advanced analysis data
-        "job_matches": comprehensive_analysis['job_matches'],
-        "keyword_analysis": comprehensive_analysis['keyword_analysis'],
-        "skill_gaps": comprehensive_analysis['skill_gaps'],
-        "quantified_suggestions": comprehensive_analysis['quantified_suggestions'],
-        "summary_suggestions": comprehensive_analysis['summary_suggestions'],
-        "skills_suggestions": comprehensive_analysis['skills_suggestions'],
-        "ats_explanation": comprehensive_analysis['ats_explanation']
+        "job_matches": analysis_snapshot['job_matches'],
+        "keyword_analysis": analysis_snapshot['keyword_analysis'],
+        "skill_gaps": analysis_snapshot['skill_gaps'],
+        "quantified_suggestions": analysis_snapshot['quantified_suggestions'],
+        "summary_suggestions": analysis_snapshot['summary_suggestions'],
+        "skills_suggestions": analysis_snapshot['skills_suggestions'],
+        "ats_explanation": analysis_snapshot['ats_explanation']
     })
 
 @app.route('/submit_feedback', methods=['POST'])
@@ -3045,12 +3480,13 @@ def reply_feedback():
 def generate_ai_response(message, context=""):
     """Generate AI response for resume assistance."""
     message_lower = message.lower()
+    normalized_message = re.sub(r'[^a-z0-9\s]', ' ', message_lower)
+    normalized_message = re.sub(r'\s+', ' ', normalized_message).strip()
     
     # Parse context to extract useful information
     user_analysis = {}
     if context:
         # Extract ATS score if available
-        import re
         score_match = re.search(r"ATS score of (\d+)", context)
         if score_match:
             user_analysis['ats_score'] = int(score_match.group(1))
@@ -3059,6 +3495,58 @@ def generate_ai_response(message, context=""):
         matches_match = re.search(r"Top job matches: (.+)", context)
         if matches_match:
             user_analysis['job_matches'] = matches_match.group(1).split(", ")
+
+    greeting_terms = {'hi', 'hello', 'hey', 'hii', 'helo', 'greetings'}
+    is_greeting = normalized_message in greeting_terms
+    asks_what_is_ats = (
+        'what is ats' in normalized_message or
+        'whatis ats' in normalized_message or
+        'what s ats' in normalized_message or
+        'define ats' in normalized_message or
+        'meaning of ats' in normalized_message or
+        normalized_message == 'ats meaning'
+    )
+    asks_how_to_improve_ats = (
+        'how to improve ats score' in normalized_message or
+        'improve ats score' in normalized_message or
+        'increase ats score' in normalized_message or
+        'boost ats score' in normalized_message or
+        'ats optimization' in normalized_message or
+        'ats optimize' in normalized_message or
+        'optimize ats' in normalized_message
+    )
+    asks_for_ats_score = (
+        normalized_message in {'ats', 'ats score', 'score', 'my ats score'} or
+        'current ats score' in normalized_message or
+        'show ats score' in normalized_message
+    )
+
+    if is_greeting:
+        top_roles = user_analysis.get('job_matches', [])
+        role_text = ', '.join(top_roles[:3]) if top_roles else 'your target roles'
+        ats_score = user_analysis.get('ats_score')
+        context_line = (
+            f"<div><strong>Current Context</strong>: Your latest resume ATS score is {ats_score}/100. "
+            f"Top matching roles: {role_text}.</div>"
+            if ats_score is not None else
+            "<div><strong>Current Context</strong>: Upload or analyze a resume to get personalized advice.</div>"
+        )
+        return (
+            "<div><strong>Hello!</strong> I'm here to help with your resume and career growth.</div>"
+            "<div style='margin-top:6px;'><strong>I can help with</strong></div>"
+            "<ul><li>ATS score and optimization tips</li><li>Skill suggestions for target roles</li><li>Professional summary writing</li><li>Job-fit and interview preparation</li></ul>"
+            f"{context_line}"
+            "<div style='margin-top:6px;'>Try asking: <strong>What is ATS?</strong>, <strong>Show my ATS score</strong>, or <strong>How can I improve my ATS score?</strong></div>"
+        )
+
+    if asks_what_is_ats:
+        return (
+            "<div><strong>What is ATS?</strong></div>"
+            "<div>ATS stands for <strong>Applicant Tracking System</strong>. It is software employers use to scan, sort, and rank resumes before a recruiter reviews them.</div>"
+            "<div style='margin-top:8px;'><strong>What ATS checks</strong></div>"
+            "<ul><li>Relevant keywords from the job description</li><li>Clear section headings like Experience, Education, and Skills</li><li>Simple formatting that can be parsed correctly</li><li>Role-relevant achievements and technical skills</li></ul>"
+            "<div style='margin-top:8px;'>If you want, I can also explain <strong>your ATS score</strong> or suggest ways to improve it.</div>"
+        )
     
     # Data Analyst Fresher
     if 'data analyst' in message_lower and ('fresher' in message_lower or 'new' in message_lower):
@@ -3111,7 +3599,7 @@ def generate_ai_response(message, context=""):
             )
     
     # ATS Score Improvement
-    elif any(word in message_lower for word in ['ats', 'score', 'optimize', 'optimization']):
+    elif asks_for_ats_score:
         ats_score = user_analysis.get('ats_score', 0)
         if ats_score >= 85:
             return (
@@ -3160,6 +3648,28 @@ def generate_ai_response(message, context=""):
                 "</ul>".format(ats_score=ats_score)
             )
     
+    # ATS Score Improvement
+    elif asks_how_to_improve_ats:
+        ats_score = user_analysis.get('ats_score', 0)
+        score_summary = (
+            f"<div><strong>Current ATS Score:</strong> {ats_score}/100</div>"
+            if ats_score else
+            "<div><strong>Current ATS Score:</strong> Not available yet. Upload or analyze a resume for a personalized score.</div>"
+        )
+        return (
+            "<div><strong>How to Improve Your ATS Score</strong></div>"
+            f"{score_summary}"
+            "<ul>"
+            "<li>Add job-description keywords naturally in skills, summary, and experience sections</li>"
+            "<li>Rewrite experience bullets with numbers and outcomes</li>"
+            "<li>Use standard headings like Summary, Experience, Education, and Skills</li>"
+            "<li>List important tools, languages, frameworks, and certifications explicitly</li>"
+            "<li>Avoid tables, text boxes, icons, and multi-column layouts that ATS may misread</li>"
+            "<li>Customize the resume for each role instead of sending one generic version</li>"
+            "</ul>"
+            "<div style='margin-top:8px;'>If you share a target role, I can suggest exact keywords to add.</div>"
+        )
+
     # Project Manager Interview Tips
     elif 'project manager' in message_lower and 'interview' in message_lower:
         return (
@@ -3352,6 +3862,153 @@ def generate_ai_response(message, context=""):
             "<div>What would you like to focus on today?</div>"
         )
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GOOGLE OAUTH 2.0 SIGN-IN
+# Set these in a .env or directly here (never commit real secrets to git)
+# ─────────────────────────────────────────────────────────────────────────────
+import os as _os
+from google_auth_oauthlib.flow import Flow as _GoogleFlow
+import google.auth.transport.requests as _GoogleAuthReq
+from google.oauth2 import id_token as _GoogleIdToken
+import pathlib as _pathlib
+
+GOOGLE_CLIENT_ID     = _os.environ.get("GOOGLE_CLIENT_ID",     "YOUR_GOOGLE_CLIENT_ID")
+GOOGLE_CLIENT_SECRET = _os.environ.get("GOOGLE_CLIENT_SECRET", "YOUR_GOOGLE_CLIENT_SECRET")
+GOOGLE_REDIRECT_URI  = _os.environ.get("GOOGLE_REDIRECT_URI",  "http://127.0.0.1:5000/auth/google/callback")
+
+# Allow HTTP for local dev (remove in production)
+_os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "1")
+
+_GOOGLE_SCOPES = [
+    "openid",
+    "https://www.googleapis.com/auth/userinfo.email",
+    "https://www.googleapis.com/auth/userinfo.profile",
+]
+
+def _make_google_flow():
+    return _GoogleFlow.from_client_config(
+        client_config={
+            "web": {
+                "client_id":     GOOGLE_CLIENT_ID,
+                "client_secret": GOOGLE_CLIENT_SECRET,
+                "auth_uri":      "https://accounts.google.com/o/oauth2/auth",
+                "token_uri":     "https://oauth2.googleapis.com/token",
+                "redirect_uris": [GOOGLE_REDIRECT_URI],
+            }
+        },
+        scopes=_GOOGLE_SCOPES,
+        redirect_uri=GOOGLE_REDIRECT_URI,
+    )
+
+
+@app.route("/auth/google")
+def google_login():
+    """Redirect the browser to Google's OAuth consent screen."""
+    flow = _make_google_flow()
+    auth_url, state = flow.authorization_url(
+        access_type="offline",
+        include_granted_scopes="true",
+        prompt="select_account",
+    )
+    session["google_oauth_state"] = state
+    return redirect(auth_url)
+
+
+@app.route("/auth/google/callback")
+def google_callback():
+    """Handle the redirect back from Google, create/login the user."""
+    # Validate state to prevent CSRF
+    if session.get("google_oauth_state") != request.args.get("state"):
+        flash("OAuth state mismatch. Please try again.", "danger")
+        return redirect(url_for("login"))
+
+    flow = _make_google_flow()
+    try:
+        flow.fetch_token(authorization_response=request.url)
+    except Exception as exc:
+        flash(f"Google sign-in failed: {exc}", "danger")
+        return redirect(url_for("login"))
+
+    credentials = flow.credentials
+    request_session = _GoogleAuthReq.Request()
+
+    try:
+        id_info = _GoogleIdToken.verify_oauth2_token(
+            credentials.id_token, request_session, GOOGLE_CLIENT_ID
+        )
+    except ValueError as exc:
+        flash(f"Could not verify Google token: {exc}", "danger")
+        return redirect(url_for("login"))
+
+    google_email = id_info.get("email", "").lower().strip()
+    google_name  = id_info.get("name", google_email.split("@")[0].title())
+    google_sub   = id_info.get("sub", "")   # unique Google user ID
+
+    if not google_email:
+        flash("Google did not return an email address.", "danger")
+        return redirect(url_for("login"))
+
+    # ── Upsert user in SQLite ─────────────────────────────────────────────────
+    conn = sqlite3.connect("rezumai.db")
+    cursor = conn.cursor()
+
+    # Make sure nullable columns exist (migration for existing DBs)
+    try:
+        cursor.execute("ALTER TABLE users ADD COLUMN google_sub TEXT")
+        cursor.execute("ALTER TABLE users ADD COLUMN avatar_url TEXT")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # columns already exist
+
+    cursor.execute("SELECT id, name, is_admin FROM users WHERE email = ?", (google_email,))
+    existing = cursor.fetchone()
+
+    if existing:
+        user_id   = existing[0]
+        user_name = existing[1]
+        is_admin  = bool(existing[2])
+        # Keep google_sub updated
+        cursor.execute(
+            "UPDATE users SET google_sub = ?, avatar_url = ? WHERE id = ?",
+            (google_sub, id_info.get("picture"), user_id)
+        )
+    else:
+        # New user via Google — no password needed, store sentinel
+        cursor.execute(
+            """INSERT INTO users
+               (email, name, password_hash, security_question, security_answer_hash, google_sub, avatar_url)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                google_email,
+                google_name,
+                "GOOGLE_OAUTH_NO_PASSWORD",   # sentinel — never matches any hash
+                "google_oauth",               # placeholder security question
+                "google_oauth",               # placeholder answer
+                google_sub,
+                id_info.get("picture"),
+            ),
+        )
+        user_id  = cursor.lastrowid
+        is_admin = False
+        user_name = google_name
+
+    conn.commit()
+    conn.close()
+
+    # ── Set Flask session ─────────────────────────────────────────────────────
+    session["user_id"]              = user_id
+    session["user_email"]           = google_email
+    session["user_name"]            = user_name
+    session["is_admin"]             = is_admin
+    session["current_analysis_id"]  = None
+    session["chat_language"]        = "en-US"
+    log_login(user_id)
+
+    flash(f"Welcome, {user_name}! Signed in with Google.", "success")
+    return redirect(url_for("admin_dashboard" if is_admin else "dashboard"))
+# ─────────────────────────────────────────────────────────────────────────────
+
 @app.route('/logout')
 def logout():
     session.clear()
@@ -3370,6 +4027,130 @@ def add_no_cache_headers(response):
         # In case request context is missing, just return response
         pass
     return response
+
+@app.route('/api/generate_resume_pdf', methods=['POST'])
+def api_generate_resume_pdf():
+    try:
+        resume_data = request.get_json(force=True)
+        pdf_buffer = generate_ats_pdf(resume_data)
+        pdf_buffer.seek(0)
+        return send_file(
+            pdf_buffer,
+            as_attachment=True,
+            download_name='resume.pdf',
+            mimetype='application/pdf'
+        )
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'Error generating resume: {str(e)}'})
+
+@app.route('/api/analyze_resume', methods=['POST'])
+def api_analyze_resume():
+    try:
+        resume_data = request.get_json(force=True)
+        text = f"{resume_data.get('firstName', '')} {resume_data.get('lastName', '')} "
+        text += resume_data.get('summary', '') + " "
+        text += " ".join(resume_data.get('skills', [])) + " "
+        for exp in resume_data.get('experience', []):
+            text += f"{exp.get('role', '')} {exp.get('company', '')} {exp.get('description', '')} "
+        
+        # Call the Gemini API logic instead of local rules
+        analysis = full_resume_analysis(text)
+        return jsonify({'success': True, 'data': analysis})
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)})
+
+@app.route('/api/generate_summary', methods=['POST'])
+def api_generate_summary():
+    try:
+        resume_data = request.get_json(force=True)
+        text = f"Skills: {', '.join(resume_data.get('skills', []))}. "
+        
+        # Also grab education if passed from the builder
+        edu_list = resume_data.get('education', [])
+        if edu_list:
+            text += "Education: " + ", ".join([f"{e.get('degree','')} at {e.get('institution','')}" for e in edu_list]) + ". "
+        
+        for exp in resume_data.get('experience', []):
+            text += f"Experience: {exp.get('role', '')} at {exp.get('company', '')}. "
+            
+        import google.generativeai as genai
+        # Gemini config should be loaded globally but we can call generate_content
+        model = genai.GenerativeModel('gemini-2.5-flash')
+        prompt = f"Write a professional 2-3 sentence resume summary based on the following background. Do not include introductory phrases, just the summary text: {text}"
+        response = model.generate_content(prompt)
+        return jsonify({'success': True, 'summary': response.text.strip()})
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)})
+
+
+@app.route('/api/session')
+def api_session():
+    return jsonify({
+        'success': True,
+        'isAuthenticated': 'user_id' in session,
+        'isAdmin': bool(session.get('is_admin')),
+        'chatLanguage': session.get('chat_language', 'en-US'),
+        'user': {
+            'id': session.get('user_id'),
+            'name': session.get('user_name', ''),
+            'email': session.get('user_email', '')
+        } if 'user_id' in session else None,
+        'securityQuestions': SECURITY_QUESTIONS
+    })
+
+
+@app.route('/api/dashboard')
+def api_dashboard():
+    if 'user_id' not in session or session.get('is_admin'):
+        return jsonify({'success': False, 'message': 'Unauthorized'}), 401
+    return jsonify({'success': True, 'data': build_dashboard_payload(session['user_id'])})
+
+
+@app.route('/api/resume_builder')
+def api_resume_builder():
+    if 'user_id' not in session:
+        return jsonify({'success': False, 'message': 'Unauthorized'}), 401
+    return jsonify({'success': True, 'data': build_resume_builder_payload(session['user_id'])})
+
+
+@app.route('/api/save_resume', methods=['POST'])
+def api_save_resume():
+    return save_resume()
+
+
+@app.route('/api/chat', methods=['POST'])
+def api_chat():
+    return chat()
+
+
+@app.route('/api/submit_feedback', methods=['POST'])
+def api_submit_feedback():
+    if 'user_id' not in session:
+        return jsonify({'success': False, 'message': 'Unauthorized'}), 401
+
+    data = request.get_json(silent=True) or {}
+    rating = int(data.get('rating', 0))
+    suggestion = (data.get('suggestion') or '').strip()
+
+    if rating < 1 or rating > 5:
+        return jsonify({'success': False, 'message': 'Please provide a rating between 1 and 5.'}), 400
+
+    conn = sqlite3.connect('rezumai.db')
+    cursor = conn.cursor()
+    cursor.execute(
+        'INSERT INTO feedback (user_id, rating, suggestion) VALUES (?, ?, ?)',
+        (session['user_id'], rating, suggestion)
+    )
+    conn.commit()
+    conn.close()
+
+    return jsonify({'success': True, 'message': 'Thank you for your feedback!'})
+
+
+@app.route('/api/logout', methods=['POST'])
+def api_logout():
+    session.clear()
+    return jsonify({'success': True})
 
 if __name__ == '__main__':
     init_db()
