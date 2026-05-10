@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/lintothoppil/Careevo/main/assets/logo.png" alt="CareEvo Logo" width="120"/>
+  <img src="https://raw.githubusercontent.com/lintothoppil/Careevo/main/static/images/careevo-logo.png" alt="CareEvo Logo" width="120"/>
 </p>
 
 <h1 align="center">CareEvo</h1>
