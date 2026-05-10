@@ -1,79 +1,125 @@
-# Careevo
+<p align="center">
+  <img src="https://raw.githubusercontent.com/lintothoppil/Careevo/main/assets/logo.png" alt="CareEvo Logo" width="120"/>
+</p>
 
-Careevo is a modern, AI-powered Resume Builder and ATS (Applicant Tracking System) platform. It provides high-accuracy, universal resume parsing, weighted ATS scoring, actionable feedback, and a seamless resume building experience.
+<h1 align="center">CareEvo</h1>
+
+<p align="center">
+  <b>AI-Powered Resume Builder & ATS Platform</b><br/>
+  <i>Build smarter resumes. Beat the bots. Land the job.</i>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Python-3.8+-3776AB?style=for-the-badge&logo=python&logoColor=white"/>
+  <img src="https://img.shields.io/badge/Flask-Backend-000000?style=for-the-badge&logo=flask&logoColor=white"/>
+  <img src="https://img.shields.io/badge/React-Frontend-61DAFB?style=for-the-badge&logo=react&logoColor=black"/>
+  <img src="https://img.shields.io/badge/Gemini_AI-Powered-4285F4?style=for-the-badge&logo=google&logoColor=white"/>
+  <img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge"/>
+</p>
+
+---
+
+## 🌿 What is CareEvo?
+
+**CareEvo** is a modern, AI-powered Resume Builder and ATS (Applicant Tracking System) platform. It provides high-accuracy, universal resume parsing, weighted ATS scoring, actionable feedback, and a seamless resume building experience — all in one place.
+
+> 🔁 CareEvo is the evolved successor of [Rezumai](https://github.com/lintothoppil/rezumai), rebuilt from the ground up with a new stack, smarter AI, and a refined UX.
+
+---
 
 ## ✨ Features
 
 ### 🧠 Intelligent Resume Analysis
-- **Universal Skill Extraction**: Accurately extracts skills from uploaded resumes across all professional domains.
-- **Advanced ATS Scoring**: Weighted scoring system that grades resumes based on keyword matches, skill relevance, experience depth, educational background, and ATS-friendly formatting.
-- **Semantic Job Matching**: Uses AI-powered similarity algorithms to match candidate skills against a wide variety of job roles and provides top recommendations.
-- **Skill Gap Analysis**: Identifies missing critical and bonus skills for your target role and suggests actionable improvements and courses.
-- **Comprehensive Resume Overview**: Generates a detailed narrative on strengths, weaknesses, and concrete steps to improve your profile.
+- **Universal Skill Extraction** — Accurately extracts skills across all professional domains
+- **Advanced ATS Scoring** — Weighted scoring based on keywords, experience depth, education, and ATS-friendly formatting
+- **Semantic Job Matching** — AI-powered similarity algorithms match you to top job roles
+- **Skill Gap Analysis** — Identifies missing critical and bonus skills for your target role with actionable course suggestions
+- **Comprehensive Resume Overview** — Generates a detailed narrative on strengths, weaknesses, and improvement steps
 
 ### 📝 Resume Builder
-- **Dynamic React Builder**: An interactive, modern UI for building resumes block-by-block.
-- **ATS-Optimized Templates**: Generates clean, easily parsable PDFs (`CV_John_Doe.pdf`) designed specifically to beat automated ATS screeners.
-- **Skill Recommendations**: AI-driven live skill and career summary suggestions during the resume creation process.
+- **Dynamic React Builder** — Interactive, modern UI for building resumes block-by-block
+- **ATS-Optimized Templates** — Clean, parsable PDFs (`CV_John_Doe.pdf`) designed to beat automated screeners
+- **Live AI Suggestions** — Real-time skill and career summary recommendations during resume creation
 
 ### 🔐 Authentication & UI
-- **Google OAuth Integration**: Streamlined login and registration using Google credentials.
-- **Modern UI/UX**: Soft Mint and Charcoal design system with circular loading indicators, micro-animations, and a highly responsive layout.
+- **Google OAuth Integration** — Streamlined login and registration using Google credentials
+- **Modern UI/UX** — Soft Mint & Charcoal design system with micro-animations and a fully responsive layout
 
 ---
 
-## 🚀 How to Host on Another System
+## 🛠️ Tech Stack
 
-To host Careevo locally or on a server, follow these instructions. 
+| Layer | Technology |
+|---|---|
+| Frontend | React + Vite |
+| Backend | Python / Flask |
+| AI Engine | Google Gemini API |
+| Auth | Google OAuth 2.0 |
+| PDF Output | ATS-optimized templates |
+| Styling | Custom design system (Mint & Charcoal) |
+
+---
+
+## 🚀 Getting Started
 
 ### Prerequisites
-- **Python 3.8+** installed
-- **Node.js 16+** and npm (for the frontend builder)
-- **Git**
+
+- Python `3.8+`
+- Node.js `16+` and npm
+- Git
+
+---
 
 ### 1. Clone the Repository
+
 ```bash
 git clone https://github.com/lintothoppil/Careevo.git
 cd Careevo
 ```
 
-### 2. Environment Variables Setup
-Create a `.env` file in the root of the project directory. You will need to add your API credentials here:
+---
+
+### 2. Environment Variables
+
+Create a `.env` file in the root directory:
+
 ```env
-# Google Gemini AI API Key
+# Google Gemini AI
 GEMINI_API_KEY=your_gemini_api_key_here
 
-# Google OAuth Credentials (for Login/Signup)
+# Google OAuth
 GOOGLE_CLIENT_ID=your_google_client_id_here
 GOOGLE_CLIENT_SECRET=your_google_client_secret_here
 
-# Flask App Secret
+# Flask
 SECRET_KEY=your_random_flask_secret_key_here
 ```
 
-### 3. Backend Setup (Flask)
-Set up a Python virtual environment to keep dependencies isolated:
+---
 
-**On Windows:**
+### 3. Backend Setup (Flask)
+
+**Windows:**
 ```powershell
 python -m venv venv
 venv\Scripts\activate
 ```
 
-**On macOS / Linux:**
+**macOS / Linux:**
 ```bash
 python3 -m venv venv
 source venv/bin/activate
 ```
 
-Install the required Python packages:
+Install dependencies:
 ```bash
 pip install -r requirements.txt
-pip install python-dotenv  # Required for loading the .env file
+pip install python-dotenv
 ```
 
-### 4. Frontend Setup (React/Vite)
-The modern resume builder is built using React. Navigate to the frontend directory to install dependencies and build it.
+---
+
+### 4. Frontend Setup (React + Vite)
 
 ```bash
 cd frontend
@@ -81,17 +127,78 @@ npm install
 npm run build
 cd ..
 ```
-*(Note: If your Flask app serves the React build from the `static` folder, you might need to copy the `dist` contents over, or just let Flask serve it directly if configured to do so).*
 
-### 5. Running the Application
-Initialize the database and start the Flask development server:
+---
+
+### 5. Run the App
 
 ```bash
 python app.py
 ```
-The server will typically start on `http://127.0.0.1:5000/`. Open this URL in your browser to access the Careevo application.
 
-### 6. Production Deployment Notes
-For a true production environment, **do not use the Flask development server**. Instead, use a production-ready WSGI server like **Gunicorn** or **Waitress** and set up a reverse proxy like **Nginx**:
-- **Gunicorn (Linux)**: `gunicorn -w 4 -b 127.0.0.1:5000 app:app`
-- **Waitress (Windows)**: `waitress-serve --port=5000 app:app`
+Open your browser at **http://127.0.0.1:5000**
+
+---
+
+## 🏭 Production Deployment
+
+> ⚠️ Do **not** use the Flask development server in production.
+
+**Linux — Gunicorn:**
+```bash
+gunicorn -w 4 -b 127.0.0.1:5000 app:app
+```
+
+**Windows — Waitress:**
+```bash
+waitress-serve --port=5000 app:app
+```
+
+Pair with **Nginx** as a reverse proxy for best results.
+
+---
+
+## 📁 Project Structure
+
+```
+Careevo/
+├── app.py                  # Flask entry point
+├── requirements.txt        # Python dependencies
+├── .env                    # Environment variables (not committed)
+├── frontend/               # React + Vite frontend
+│   ├── src/
+│   └── dist/               # Built frontend (served by Flask)
+├── static/                 # Flask static files
+└── templates/              # Flask HTML templates
+```
+
+---
+
+## 🤝 Contributing
+
+Contributions, issues, and feature requests are welcome!
+
+1. Fork the repo
+2. Create your branch: `git checkout -b feature/your-feature`
+3. Commit your changes: `git commit -m 'Add your feature'`
+4. Push to the branch: `git push origin feature/your-feature`
+5. Open a Pull Request
+
+---
+
+## 📄 License
+
+This project is licensed under the **MIT License**.
+
+---
+
+## 👨‍💻 Author
+
+**Linto Thoppil**
+GitHub: [@lintothoppil](https://github.com/lintothoppil)
+
+---
+
+<p align="center">
+  Made with 💚 by the CareEvo team · <i>Evolve your career.</i>
+</p>
