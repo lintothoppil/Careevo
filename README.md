@@ -200,5 +200,5 @@ GitHub: [@lintothoppil](https://github.com/lintothoppil)
 ---
 
 <p align="center">
-  Made with 💚 by the CareEvo team · <i>Evolve your career.</i>
+  Made with 💚 by the CareEvo · <i>Your career Mate.</i>
 </p>
